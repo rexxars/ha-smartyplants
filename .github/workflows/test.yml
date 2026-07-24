@@ -44,5 +44,6 @@ jobs:
       - run: pip install -r requirements.txt -r requirements_test.txt
       - run: pytest tests/live/ -v --timeout=90
         env:
+          SMARTYPLANTS_REQUIRE_LIVE: "1"
           SMARTYPLANTS_EMAIL: ${{ secrets.SMARTYPLANTS_EMAIL }}
           SMARTYPLANTS_PASSWORD: ${{ secrets.SMARTYPLANTS_PASSWORD }}
