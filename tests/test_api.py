@@ -9,8 +9,9 @@ import pytest
 
 from custom_components.smartyplants.api import (
     SmartyPlantsClient,
-    _parse_plant,
+    _parse_metadata,
     _parse_reading,
+    _parse_sensor_entry,
     _parse_thresholds,
 )
 from custom_components.smartyplants.exceptions import (
@@ -100,17 +101,95 @@ def _refresh_response_json(new_access_token: str) -> dict:
     }
 
 
-def _plant_api_data() -> dict:
-    """Return a single raw plant as the API would return it."""
+def _sensor_status_data() -> dict:
+    """Return a lastSensorStatusData block as /sensors returns it."""
     return {
-        "id": MOCK_PLANT_ID,
-        "name": "Monstera",
-        "imageUrl": "https://example.com/monstera.jpg",
-        "sensor": {
-            "id": MOCK_SENSOR_ID,
-            "identifier": "SP-001",
-            "isOnline": True,
+        "temperature": {
+            "value": 22.5,
+            "status": "OPTIMAL",
+            "message": "Temperature is great",
         },
+        "humidity": {
+            "value": 55.0,
+            "status": "OPTIMAL",
+            "message": "Humidity is good",
+        },
+        "waterLevel": {
+            "value": 40.0,
+            "status": "LOW",
+            "message": "Needs water",
+        },
+        "light": {
+            "value": 800.0,
+            "status": "OPTIMAL",
+            "message": "Good light",
+        },
+        # The API returns nutrient as a human-readable string, not a number.
+        "nutrient": {
+            "value": "Well fertilised",
+            "status": "OPTIMAL",
+            "message": "Nutrients OK",
+        },
+        "batteryPercent": {
+            "value": 85.0,
+            "status": "OPTIMAL",
+            "message": "Battery good",
+        },
+        "voltage": {
+            "value": 3.7,
+            "status": "OPTIMAL",
+            "message": "Voltage OK",
+        },
+        # lightQuality can be a bare "-" when there is no reading.
+        "lightQuality": {"value": "-", "status": "-", "message": ""},
+    }
+
+
+def _sensors_entry(
+    *,
+    plant_id: str = MOCK_PLANT_ID,
+    sensor_id: str = MOCK_SENSOR_ID,
+    name: str = "Monstera",
+    online: bool = True,
+) -> dict:
+    """Return a single item from the /sensors response."""
+    return {
+        "sensor": {
+            "id": sensor_id,
+            "identifier": "SP-001",
+            "isOnline": online,
+            "batteryPercentage": 85,
+            "lastSensorStatusData": _sensor_status_data(),
+        },
+        "currentPlant": {
+            "id": plant_id,
+            "name": name,
+            "imageUrl": "https://example.com/monstera.jpg",
+            "sensorId": sensor_id,
+        },
+    }
+
+
+def _sensors_response(entries: list[dict], *, has_next: bool = False) -> dict:
+    """Wrap /sensors entries in the paginated response envelope."""
+    return {
+        "success": True,
+        "data": entries,
+        "message": "Sensors fetched successfully",
+        "meta": {"page": 1, "limit": 50, "hasNextPage": has_next},
+    }
+
+
+def _plant_detail_data(
+    *,
+    plant_id: str = MOCK_PLANT_ID,
+    name: str = "Monstera",
+) -> dict:
+    """Return the `data` block of a /plant/{id} detail response."""
+    return {
+        "id": plant_id,
+        "name": name,
+        "environment": {"name": "Living Room"},
         "plantReference": {
             "scientificNameWithoutAuthor": "deliciosa",
             "genus": "Monstera",
@@ -133,48 +212,19 @@ def _plant_api_data() -> dict:
                 },
             ],
         },
-        "sensors": [
-            {
-                "sensor": {"id": MOCK_SENSOR_ID},
-                "sensorData": {
-                    "temperature": {
-                        "value": 22.5,
-                        "status": "OPTIMAL",
-                        "message": "Temperature is great",
-                    },
-                    "humidity": {
-                        "value": 55.0,
-                        "status": "OPTIMAL",
-                        "message": "Humidity is good",
-                    },
-                    "waterLevel": {
-                        "value": 40.0,
-                        "status": "LOW",
-                        "message": "Needs water",
-                    },
-                    "light": {
-                        "value": 800.0,
-                        "status": "OPTIMAL",
-                        "message": "Good light",
-                    },
-                    "nutrient": {
-                        "value": 1.5,
-                        "status": "OPTIMAL",
-                        "message": "Nutrients OK",
-                    },
-                    "batteryPercent": {
-                        "value": 85.0,
-                        "status": "OPTIMAL",
-                        "message": "Battery good",
-                    },
-                    "voltage": {
-                        "value": 3.7,
-                        "status": "OPTIMAL",
-                        "message": "Voltage OK",
-                    },
-                },
-            }
-        ],
+    }
+
+
+def _plant_detail_response(
+    *,
+    plant_id: str = MOCK_PLANT_ID,
+    name: str = "Monstera",
+) -> dict:
+    """Wrap plant detail data in the response envelope."""
+    return {
+        "success": True,
+        "data": _plant_detail_data(plant_id=plant_id, name=name),
+        "message": "Plant fetched successfully",
     }
 
 
@@ -302,6 +352,15 @@ class TestParsingHelpers:
         assert result.value is None
         assert result.status == "LOW"
 
+    def test_parse_reading_non_numeric_value(self) -> None:
+        """Test that a non-numeric value (e.g. nutrient text) yields value None."""
+        raw = {"value": "Well fertilised", "status": "OPTIMAL", "message": "Great"}
+        result = _parse_reading(raw)
+        assert result is not None
+        assert result.value is None
+        assert result.status == "OPTIMAL"
+        assert result.message == "Great"
+
     def test_parse_thresholds_temperature(self) -> None:
         """Test parsing temperature thresholds."""
         configs = [
@@ -336,144 +395,180 @@ class TestParsingHelpers:
         assert "nutrient" in result
         assert "salinity" not in result
 
-    def test_parse_plant_no_sensor_returns_none(self) -> None:
-        """Test that a plant without sensor returns None."""
-        raw = {
-            "id": MOCK_PLANT_ID,
-            "name": "Lonely plant",
-            "sensor": None,
+    def test_parse_sensor_entry_no_current_plant_returns_none(self) -> None:
+        """Test that a /sensors entry with no assigned plant returns None."""
+        entry = {
+            "sensor": {"id": MOCK_SENSOR_ID, "isOnline": True},
+            "currentPlant": None,
         }
-        result = _parse_plant(raw)
+        result = _parse_sensor_entry(entry)
         assert result is None
 
-    def test_parse_plant_full_data(self) -> None:
-        """Test parsing a complete plant with all data."""
-        raw = _plant_api_data()
-        result = _parse_plant(raw)
+    def test_parse_sensor_entry_full(self) -> None:
+        """Test parsing a /sensors entry into base plant data (no metadata yet)."""
+        result = _parse_sensor_entry(_sensors_entry())
         assert result is not None
         assert result.plant_id == MOCK_PLANT_ID
         assert result.name == "Monstera"
-        assert result.species == "Monstera deliciosa"
-        assert result.common_names == ["Swiss cheese plant"]
         assert result.image_url == "https://example.com/monstera.jpg"
         assert result.sensor_id == MOCK_SENSOR_ID
         assert result.sensor_identifier == "SP-001"
         assert result.sensor_online is True
 
-        # Sensor readings
+        # Sensor readings come straight from lastSensorStatusData.
         assert result.temperature is not None
         assert result.temperature.value == 22.5
         assert result.humidity is not None
         assert result.humidity.value == 55.0
-        assert result.moisture is not None
+        assert result.moisture is not None  # from waterLevel
         assert result.moisture.value == 40.0
         assert result.light is not None
         assert result.light.value == 800.0
-        assert result.nutrient is not None
-        assert result.nutrient.value == 1.5
-        assert result.battery is not None
+        assert result.battery is not None  # from batteryPercent
         assert result.battery.value == 85.0
         assert result.voltage is not None
         assert result.voltage.value == 3.7
+        # nutrient is textual -> reading present, value None
+        assert result.nutrient is not None
+        assert result.nutrient.value is None
+        assert result.nutrient.status == "OPTIMAL"
 
-        # Thresholds
-        assert "temperature" in result.thresholds
-        assert "nutrient" in result.thresholds
-        assert result.thresholds["temperature"].critical_low == 10.0
-        assert result.thresholds["nutrient"].critical_low == 0.5
+        # Metadata is not available from /sensors and must default empty.
+        assert result.species == ""
+        assert result.common_names == []
+        assert result.thresholds == {}
+        assert result.environment_name is None
+
+    def test_parse_metadata(self) -> None:
+        """Test extracting species/thresholds/environment from plant detail."""
+        meta = _parse_metadata(_plant_detail_data())
+        assert meta.species == "Monstera deliciosa"
+        assert meta.common_names == ["Swiss cheese plant"]
+        assert meta.environment_name == "Living Room"
+        assert "temperature" in meta.thresholds
+        assert "nutrient" in meta.thresholds  # SALINITY maps to nutrient
+        assert meta.thresholds["temperature"].critical_low == 10.0
+        assert meta.thresholds["nutrient"].critical_low == 0.5
 
 
 class TestGetPlants:
-    """Tests for fetching plants."""
+    """Tests for fetching plants (hybrid: /sensors + cached /plant/{id})."""
 
-    async def test_get_plants_success(self) -> None:
-        """Test successful plant fetch with one plant."""
+    async def test_get_plants_merges_readings_and_metadata(self) -> None:
+        """Readings come from /sensors, species/thresholds from plant detail."""
         session = _make_session()
-
-        plants_resp = _make_response(
-            200,
-            {
-                "success": True,
-                "data": [_plant_api_data()],
-                "meta": {
-                    "page": 1,
-                    "limit": 50,
-                    "hasNextPage": False,
-                    "totalCount": 1,
-                },
-            },
+        _set_get_responses(
+            session,
+            [
+                _make_response(200, _sensors_response([_sensors_entry()])),
+                _make_response(200, _plant_detail_response()),
+            ],
         )
-        _set_get_response(session, plants_resp)
 
         client = SmartyPlantsClient(session)
         client.set_tokens(MOCK_ACCESS_TOKEN, MOCK_REFRESH_TOKEN)
 
         result = await client.async_get_plants()
 
-        if isinstance(result, Exception):
-            raise result
         assert len(result) == 1
         plant = result[0]
         assert plant.plant_id == MOCK_PLANT_ID
         assert plant.name == "Monstera"
+        # Readings from /sensors
         assert plant.temperature is not None
         assert plant.temperature.value == 22.5
+        assert plant.moisture is not None
+        assert plant.moisture.value == 40.0
+        # Metadata from /plant/{id}
+        assert plant.species == "Monstera deliciosa"
+        assert plant.common_names == ["Swiss cheese plant"]
+        assert plant.environment_name == "Living Room"
+        assert "temperature" in plant.thresholds
+        assert plant.thresholds["temperature"].critical_low == 10.0
 
-    async def test_get_plants_skips_sensorless(self) -> None:
-        """Test that plants without sensors are skipped."""
+    async def test_get_plants_skips_unassigned_sensors(self) -> None:
+        """A sensor with no assigned plant is skipped (no detail fetched)."""
         session = _make_session()
-
-        plants_resp = _make_response(
-            200,
-            {
-                "success": True,
-                "data": [
-                    _plant_api_data(),
-                    {"id": "no-sensor-plant", "name": "Lonely", "sensor": None},
-                ],
-                "meta": {"page": 1, "limit": 50, "hasNextPage": False},
-            },
+        _set_get_responses(
+            session,
+            [
+                _make_response(
+                    200,
+                    _sensors_response(
+                        [
+                            _sensors_entry(),
+                            {
+                                "sensor": {"id": "orphan", "isOnline": False},
+                                "currentPlant": None,
+                            },
+                        ]
+                    ),
+                ),
+                _make_response(200, _plant_detail_response()),
+            ],
         )
-        _set_get_response(session, plants_resp)
 
         client = SmartyPlantsClient(session)
         client.set_tokens(MOCK_ACCESS_TOKEN, MOCK_REFRESH_TOKEN)
 
         result = await client.async_get_plants()
         assert len(result) == 1
+        # /sensors + one detail fetch only
+        assert session.get.call_count == 2
+
+    async def test_get_plants_caches_metadata_across_calls(self) -> None:
+        """Plant detail is fetched once and reused on subsequent polls."""
+        session = _make_session()
+        _set_get_responses(
+            session,
+            [
+                _make_response(200, _sensors_response([_sensors_entry()])),
+                _make_response(200, _plant_detail_response()),
+                _make_response(200, _sensors_response([_sensors_entry()])),
+            ],
+        )
+
+        client = SmartyPlantsClient(session)
+        client.set_tokens(MOCK_ACCESS_TOKEN, MOCK_REFRESH_TOKEN)
+
+        first = await client.async_get_plants()
+        second = await client.async_get_plants()
+
+        # 2 x /sensors + 1 x /plant/{id}
+        assert session.get.call_count == 3
+        assert first[0].species == "Monstera deliciosa"
+        assert second[0].species == "Monstera deliciosa"
 
     async def test_get_plants_pagination(self) -> None:
-        """Test that pagination fetches all pages."""
+        """Test that /sensors pagination fetches all pages."""
         session = _make_session()
-
-        page1_resp = _make_response(
-            200,
-            {
-                "success": True,
-                "data": [_plant_api_data()],
-                "meta": {"page": 1, "limit": 50, "hasNextPage": True},
-            },
+        _set_get_responses(
+            session,
+            [
+                _make_response(
+                    200,
+                    _sensors_response([_sensors_entry()], has_next=True),
+                ),
+                _make_response(
+                    200,
+                    _sensors_response(
+                        [_sensors_entry(plant_id="plant-2", name="Ficus")],
+                    ),
+                ),
+                _make_response(200, _plant_detail_response()),
+                _make_response(
+                    200, _plant_detail_response(plant_id="plant-2", name="Ficus")
+                ),
+            ],
         )
-        plant2 = _plant_api_data()
-        plant2["id"] = "plant-2"
-        plant2["name"] = "Ficus"
-        page2_resp = _make_response(
-            200,
-            {
-                "success": True,
-                "data": [plant2],
-                "meta": {"page": 2, "limit": 50, "hasNextPage": False},
-            },
-        )
-        _set_get_responses(session, [page1_resp, page2_resp])
 
         client = SmartyPlantsClient(session)
         client.set_tokens(MOCK_ACCESS_TOKEN, MOCK_REFRESH_TOKEN)
 
         result = await client.async_get_plants()
         assert len(result) == 2
-        assert result[0].plant_id == MOCK_PLANT_ID
-        assert result[1].plant_id == "plant-2"
+        ids = {p.plant_id for p in result}
+        assert ids == {MOCK_PLANT_ID, "plant-2"}
 
 
 class TestGetRequiresAttention:

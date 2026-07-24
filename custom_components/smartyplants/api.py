@@ -7,6 +7,7 @@ import base64
 import json
 import logging
 import time
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import aiohttp
@@ -37,13 +38,30 @@ _VARIANT_MAP: dict[str, str] = {
 }
 
 
+def _coerce_float(value: object) -> float | None:
+    """Coerce an API value to float, or None if it isn't numeric.
+
+    Some readings (e.g. nutrient "Well fertilised" or a bare "-") are text,
+    so we keep the reading for its status/message but leave value as None.
+    """
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    return None
+
+
 def _parse_reading(raw: dict[str, object] | None) -> SensorReading | None:
     """Parse a raw sensor reading dict into a SensorReading, or None."""
     if raw is None:
         return None
-    value = raw.get("value")
     return SensorReading(
-        value=float(value) if value is not None else None,
+        value=_coerce_float(raw.get("value")),
         status=str(raw.get("status", "")),
         message=str(raw.get("message", "")),
     )
@@ -68,22 +86,29 @@ def _parse_thresholds(configs: list[dict[str, object]]) -> dict[str, PlantThresh
     return result
 
 
-def _parse_plant(raw: dict[str, object]) -> PlantData | None:
-    """Parse a raw plant dict into PlantData. Returns None if no sensor."""
-    sensor = raw.get("sensor")
-    if sensor is None:
-        return None
+@dataclass
+class _PlantMetadata:
+    """Rarely-changing plant metadata sourced from the /plant/{id} detail."""
 
-    if not isinstance(sensor, dict):
-        return None
+    species: str = ""
+    common_names: list[str] = field(default_factory=list)
+    environment_name: str | None = None
+    thresholds: dict[str, PlantThresholds] = field(default_factory=dict)
 
-    plant_ref = raw.get("plantReference")
+
+def _parse_metadata(detail: dict[str, object]) -> _PlantMetadata:
+    """Extract species, common names, environment, and thresholds from detail.
+
+    The detail is the `data` block of a GET /plant/{id} response.
+    """
+    plant_ref = detail.get("plantReference")
     if not isinstance(plant_ref, dict):
         plant_ref = {}
 
     genus = str(plant_ref.get("genus", ""))
     species_epithet = str(plant_ref.get("scientificNameWithoutAuthor", ""))
-    species = f"{genus} {species_epithet}" if genus else species_epithet
+    species = f"{genus} {species_epithet}".strip() if genus else species_epithet
+
     common_names_raw = plant_ref.get("commonNames")
     common_names = list(common_names_raw) if isinstance(common_names_raw, list) else []
 
@@ -91,36 +116,55 @@ def _parse_plant(raw: dict[str, object]) -> PlantData | None:
     configs = list(configs_raw) if isinstance(configs_raw, list) else []
     thresholds = _parse_thresholds(configs)
 
-    # Parse sensor data from the sensors array
-    sensor_data: dict[str, object] = {}
-    sensors_list = raw.get("sensors")
-    if isinstance(sensors_list, list) and len(sensors_list) > 0:
-        first = sensors_list[0]
-        if isinstance(first, dict):
-            sd = first.get("sensorData")
-            if isinstance(sd, dict):
-                sensor_data = sd
-
-    def _reading(key: str) -> SensorReading | None:
-        val = sensor_data.get(key)
-        return _parse_reading(val) if isinstance(val, dict) else None
-
-    image_url = raw.get("imageUrl")
-
-    environment = raw.get("environment")
+    environment = detail.get("environment")
     environment_name: str | None = None
     if isinstance(environment, dict):
         env_name = environment.get("name")
         if isinstance(env_name, str) and env_name:
             environment_name = env_name
 
-    return PlantData(
-        plant_id=str(raw.get("id", "")),
-        name=str(raw.get("name", "")),
+    return _PlantMetadata(
         species=species,
         common_names=common_names,
-        image_url=image_url if isinstance(image_url, str) else None,
         environment_name=environment_name,
+        thresholds=thresholds,
+    )
+
+
+def _parse_sensor_entry(entry: dict[str, object]) -> PlantData | None:
+    """Parse a /sensors entry into PlantData, or None if unassigned.
+
+    Readings come from the sensor's lastSensorStatusData. Metadata fields
+    (species, common_names, environment_name, thresholds) are left empty and
+    filled in separately from the plant detail endpoint.
+    """
+    sensor = entry.get("sensor")
+    if not isinstance(sensor, dict):
+        return None
+
+    current = entry.get("currentPlant")
+    if not isinstance(current, dict):
+        return None
+
+    plant_id = str(current.get("id", ""))
+    if not plant_id:
+        return None
+
+    status_data = sensor.get("lastSensorStatusData")
+    sensor_data = status_data if isinstance(status_data, dict) else {}
+
+    def _reading(key: str) -> SensorReading | None:
+        val = sensor_data.get(key)
+        return _parse_reading(val) if isinstance(val, dict) else None
+
+    image_url = current.get("imageUrl")
+
+    return PlantData(
+        plant_id=plant_id,
+        name=str(current.get("name", "")),
+        species="",
+        common_names=[],
+        image_url=image_url if isinstance(image_url, str) else None,
         sensor_id=(str(sensor.get("id", "")) if sensor.get("id") else None),
         sensor_identifier=(
             str(sensor.get("identifier", "")) if sensor.get("identifier") else None
@@ -133,7 +177,6 @@ def _parse_plant(raw: dict[str, object]) -> PlantData | None:
         nutrient=_reading("nutrient"),
         battery=_reading("batteryPercent"),
         voltage=_reading("voltage"),
-        thresholds=thresholds,
     )
 
 
@@ -145,6 +188,7 @@ class SmartyPlantsClient:
         self._session = session
         self._access_token: str | None = None
         self._refresh_token: str | None = None
+        self._metadata_cache: dict[str, _PlantMetadata] = {}
         self._lock = asyncio.Lock()
         self._token_updated_callback: (
             Callable[[str, str | None], Coroutine[Any, Any, None]] | None
@@ -350,14 +394,49 @@ class SmartyPlantsClient:
             return new_access_token
 
     async def async_get_plants(self) -> list[PlantData]:
-        """Fetch all plants from the API."""
-        raw_plants = await self._async_get_paginated("/plant")
+        """Fetch all plants, merging live readings with cached metadata.
+
+        Readings come from /sensors (one request for all plants). Species,
+        common names, environment, and thresholds come from the per-plant
+        /plant/{id} detail, which is fetched once and cached since it rarely
+        changes.
+        """
+        entries = await self._async_get_paginated("/sensors")
         plants: list[PlantData] = []
-        for raw in raw_plants:
-            parsed = _parse_plant(raw)
-            if parsed is not None:
-                plants.append(parsed)
+        for entry in entries:
+            plant = _parse_sensor_entry(entry)
+            if plant is None:
+                continue
+            metadata = await self._async_get_plant_metadata(plant.plant_id)
+            plant.species = metadata.species
+            plant.common_names = metadata.common_names
+            plant.environment_name = metadata.environment_name
+            plant.thresholds = metadata.thresholds
+            plants.append(plant)
         return plants
+
+    async def _async_get_plant_metadata(self, plant_id: str) -> _PlantMetadata:
+        """Return cached plant metadata, fetching /plant/{id} once per plant.
+
+        Metadata is best-effort: if the detail request fails (other than an
+        auth error, which must propagate for reauth), the plant is still
+        returned with its readings and the fetch is retried on the next poll.
+        """
+        cached = self._metadata_cache.get(plant_id)
+        if cached is not None:
+            return cached
+
+        try:
+            detail = await self._async_get(f"/plant/{plant_id}")
+        except SmartyPlantsAuthError:
+            raise
+        except SmartyPlantsError:
+            return _PlantMetadata()
+
+        data = detail.get("data")
+        metadata = _parse_metadata(data if isinstance(data, dict) else {})
+        self._metadata_cache[plant_id] = metadata
+        return metadata
 
     async def async_get_requires_attention(self) -> set[str]:
         """Fetch plant IDs that require attention."""
